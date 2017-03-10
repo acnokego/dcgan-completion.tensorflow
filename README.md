@@ -7,6 +7,8 @@
 
 Additional Requirement 
 -----------
-`$pip install scikit-image`
++ [scikit image](http://scikit-image.org/)
+
+	`$ pip install scikit-image`
 
 
