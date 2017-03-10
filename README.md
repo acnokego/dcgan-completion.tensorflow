@@ -7,6 +7,6 @@
 
 Additional Requirement 
 -----------
-$pip install scikit-image
+`$pip install scikit-image`
 
 
