@@ -4,15 +4,20 @@
 # [2016-08-05] Modifications for Completion: Brandon Amos (http://bamos.github.io)
 #   + License: MIT
 
+
 from __future__ import division
 import os
 import time
 from glob import glob
 import tensorflow as tf
 from six.moves import xrange
-
+import numpy as np
 from ops import *
 from utils import *
+from PIL import Image
+from scipy import misc, io
+from scipy.sparse import csr_matrix
+from skimage.morphology import closing, opening, square, disk
 
 class DCGAN(object):
     def __init__(self, sess, image_size=64, is_crop=False,
@@ -35,6 +40,8 @@ class DCGAN(object):
         self.sess = sess
         self.is_crop = is_crop
         self.batch_size = batch_size
+        # set for mask
+        #self.batch_size = 1
         self.image_size = image_size
         self.sample_size = sample_size
         self.image_shape = [image_size, image_size, 3]
@@ -117,6 +124,20 @@ class DCGAN(object):
         self.perceptual_loss = self.g_loss
         self.complete_loss = self.contextual_loss + self.lam*self.perceptual_loss
         self.grad_complete_loss = tf.gradients(self.complete_loss, self.z)
+
+
+
+        self.X = tf.mul(1-self.mask, self.G) + tf.mul(self.mask, self.images)
+        self.D_2, self.D_logits_2 = self.discriminator(self.X , reuse=True)
+        self.perceptual_loss_2 = tf.reduce_mean(
+            tf.nn.sigmoid_cross_entropy_with_logits(self.D_logits_2,
+                                                    tf.ones_like(self.D_2)))
+
+        self.complete_loss_2 = self.contextual_loss + self.lam*self.perceptual_loss_2
+
+        self.grad_complete_loss_2 = tf.gradients(self.complete_loss_2, self.z)
+
+
 
     def train(self, config):
         data = glob(os.path.join(config.dataset, "*.png"))
@@ -216,19 +237,23 @@ Initializing a new one.
                     self.save(config.checkpoint_dir, counter)
 
 
-    def complete(self, config):
-        os.makedirs(os.path.join(config.outDir, 'hats_imgs'), exist_ok=True)
-        os.makedirs(os.path.join(config.outDir, 'completed'), exist_ok=True)
 
+    def complete(self, config):
+        #####################################################
+        # This function was modified by Yu-An Chen and Wei-Che Chen
+        #####################################################
+        os.makedirs(os.path.join(config.outDir, 'hats_imgs'))
+        os.makedirs(os.path.join(config.outDir, 'completed'))
+        os.makedirs(os.path.join(config.outDir, 'mask'))
         tf.initialize_all_variables().run()
 
         isLoaded = self.load(self.checkpoint_dir)
         assert(isLoaded)
 
-        # data = glob(os.path.join(config.dataset, "*.png"))
+        #data = glob(os.path.join(config.dataset, "*.png"))
         nImgs = len(config.imgs)
 
-        batch_idxs = int(np.ceil(nImgs/self.batch_size))
+        #batch_idxs = int(np.ceil(nImgs/self.batch_size))
         if config.maskType == 'random':
             fraction_masked = 0.2
             mask = np.ones(self.image_shape)
@@ -247,19 +272,24 @@ Initializing a new one.
             mask[:,:c,:] = 0.0
         elif config.maskType == 'full':
             mask = np.ones(self.image_shape)
+        elif config.maskType == 'Eye':
+            mask = np.ones(self.image_shape)
+            mask[:26,:,:] = 0
+        elif config.maskType == 'Scarf':
+            mask = np.ones(self.image_shape)
+            mask[25:,:,:] = 0
         else:
             assert(False)
 
-        for idx in xrange(0, batch_idxs):
-            l = idx*self.batch_size
-            u = min((idx+1)*self.batch_size, nImgs)
+        for idx in xrange(0, config.maskIter):
+            l = 0
+            u = nImgs
             batchSz = u-l
             batch_files = config.imgs[l:u]
             batch = [get_image(batch_file, self.image_size, is_crop=self.is_crop)
                      for batch_file in batch_files]
             batch_images = np.array(batch).astype(np.float32)
             if batchSz < self.batch_size:
-                print(batchSz)
                 padSz = ((0, int(self.batch_size-batchSz)), (0,0), (0,0), (0,0))
                 batch_images = np.pad(batch_images, padSz, 'constant')
                 batch_images = batch_images.astype(np.float32)
@@ -273,8 +303,13 @@ Initializing a new one.
             save_images(batch_images[:batchSz,:,:,:], [nRows,nCols],
                         os.path.join(config.outDir, 'before.png'))
             masked_images = np.multiply(batch_images, batch_mask)
-            save_images(masked_images[:batchSz,:,:,:], [nRows,nCols],
-                        os.path.join(config.outDir, 'masked.png'))
+
+            m = np.zeros((1,self.z_dim)).astype('float32')
+            v = np.zeros((1,self.z_dim)).astype('float32')
+            beta1 = float(0.9)
+            beta2 = float(0.999)
+            epil = 1e-8
+            t = 0
 
             for i in xrange(config.nIter):
                 fd = {
@@ -282,27 +317,70 @@ Initializing a new one.
                     self.mask: batch_mask,
                     self.images: batch_images,
                 }
-                run = [self.complete_loss, self.grad_complete_loss, self.G]
+                ## 0 for original loss, 1 for our revised loss
+                complete_loss = self.complete_loss_2
+                grad_complete_loss = self.grad_complete_loss_2
+                if config.loss == 0:
+                    complete_loss = self.complete_loss
+                    grad_complete_loss = self.grad_complete_loss
+                run = [complete_loss, grad_complete_loss, self.G]
                 loss, g, G_imgs = self.sess.run(run, feed_dict=fd)
 
-                v_prev = np.copy(v)
-                v = config.momentum*v - config.lr*g[0]
-                zhats += -config.momentum * v_prev + (1+config.momentum)*v
-                zhats = np.clip(zhats, -1, 1)
+                ### Adam optimizer
+                g = np.asarray(g[0])
+                t += 1
+                lr_t = config.lr *np.sqrt(1-beta2**t)/(1-beta1**t)
+                m = beta1*m + (1-beta1)*g
+                v = beta2*v + (1-beta2)*g**2
+                zhats =  zhats -  config.lr*m/(np.sqrt(v)+epil)
+                zhats = zhats.astype('float64')
+                zhats = self.renorm(zhats, 1, 1)
+                zhats = zhats.eval()
 
-                if i % 50 == 0:
-                    print(i, np.mean(loss[0:batchSz]))
+                if i % 50 == 0 :
+                    print("Val_loss=",i, np.mean(loss[0:batchSz]))
                     imgName = os.path.join(config.outDir,
                                            'hats_imgs/{:04d}.png'.format(i))
+
+                    ### if the masks are updated iteratively, 
+                    ### we save the imgs with the file name of the number of iterations
+
+                    if config.maskIter is not 0:
+                        imgName = os.path.join(config.outDir,
+                                           'hats_imgs/{:02d}.png'.format(idx))
+
                     nRows = np.ceil(batchSz/8)
                     nCols = 8
+
                     save_images(G_imgs[:batchSz,:,:,:], [nRows,nCols], imgName)
 
                     inv_masked_hat_images = np.multiply(G_imgs, 1.0-batch_mask)
                     completeed = masked_images + inv_masked_hat_images
                     imgName = os.path.join(config.outDir,
                                            'completed/{:04d}.png'.format(i))
+                    if config.maskIter is not 0:
+                        imgName = os.path.join(config.outDir,
+                                           'completed/{:02d}.png'.format(idx))
+
                     save_images(completeed[:batchSz,:,:,:], [nRows,nCols], imgName)
+
+            if config.maskIter is not 0:
+                print("================== update mask ==============================")
+                mask = np.zeros(batch_mask.shape[:3])
+                for ii in range(self.batch_size):
+                    print ("calculating mask %d......"%(ii))
+                    mask[ii] = self.calc_mask(255*inverse_transform(batch_images[ii]),
+                                                255*inverse_transform(G_imgs[ii]),config)
+
+                maskMat = os.path.join(config.outDir,'mask/{:02d}.mat'.format(idx))
+                io.savemat(maskMat,mdict = {'mask' : mask[4]})
+                mask = np.reshape(mask, (batchSz, mask.shape[1], mask.shape[2],1))
+                mask = np.repeat(mask, 3, axis=3)
+                maskName = os.path.join(config.outDir,'mask/{:02d}.png'.format(idx))
+                nRows = np.ceil(batchSz/8)
+                nCols = 8
+                save_images(mask[:batchSz,:,:,:], [nRows,nCols], maskName)
+
 
     def discriminator(self, image, reuse=False):
         if reuse:
@@ -376,3 +454,169 @@ Initializing a new one.
             return True
         else:
             return False
+
+    def renorm(self,x, axis, max_norm):
+        
+        #####################################################
+        # This function was modified by Yu-An Chen and Wei-Che Chen
+        # code reference to http://stackoverflow.com/questions/34934303/renormalize-weight-matrix-using-tensorflow
+        #####################################################
+        '''Renormalizes the sub-tensors along axis such that they do not exceed norm max_norm.'''
+        #This elaborate dance avoids empty slices, which TF dislikes.
+        rank = tf.rank(x)
+        bigrange = tf.range(-1, rank + 1)
+        dims = tf.slice(tf.concat(0, [tf.slice(bigrange,[0], [1 + axis]),
+                        tf.slice(bigrange,[axis+2],[-1])]),[1],rank-[1])
+
+        #Determine which columns need to be renormalized.
+        l2norm_inv = tf.rsqrt(tf.reduce_sum(x*x, dims, keep_dims=True))
+        scale = max_norm*tf.minimum(tf.cast(l2norm_inv,tf.float32), tf.constant(1.0/max_norm))
+
+        #Broadcast the scalings
+        return tf.mul(scale,x)
+
+    def calc_mask(self,y0, x_recon0,config):
+        #####################################################
+        # This function was modified by Yu-An Chen and Wei-Che Chen
+        #####################################################
+        threshold = config.threshold
+        median_e = 0.6
+        mu_delta = 8
+        w = np.zeros(y0.shape)
+
+        for k in range(3):
+            y = y0[:,:,k].flatten('F')
+            y = np.reshape(y,(-1,1))
+            y = np.array(y, dtype=np.float32)
+
+            x_recon = x_recon0[:,:,k].flatten('F')
+            x_recon = np.reshape(x_recon,(-1,1))
+            x_recon = np.array(x_recon, dtype=np.float32)
+
+            residual = np.square(y-x_recon)
+            residual_sort = np.sort(residual, axis=0)
+            delta = residual_sort[np.ceil(median_e*y.shape[0])]
+            mu = (1.0*mu_delta)/(delta + 1e-10)
+            wt = 1.0/(1+1.0/np.exp(-mu*(residual-delta)))
+            w[:,:,k] = np.reshape(wt.T, (w.shape[1], w.shape[0])).T
+
+        mk0 = (w[:,:,0] + w[:,:,1] + w[:,:,2])/3
+        mk = mk0.flatten('F')
+        mk[ np.argwhere(mk < threshold)] = 0
+        mk[ np.argwhere(mk >= threshold)] = 1
+        mk = np.reshape(mk.T, (y0.shape[1],y0.shape[0]))
+        #for i in range(mk.shape[0]):
+        #    mk[i] = closing(mk[i], disk(4))
+        #    mk[i] = opening(mk[i], disk(2))
+        mk = closing(mk, disk(config.closeDisk))
+        mk = opening(mk, disk(config.openDisk))
+        return mk.T
+
+    def blending(self, source, target, mask):
+        #####################################################
+        # This function was modified by Yu-An Chen and Wei-Che Chen
+        #####################################################
+
+        temp1 = np.zeros((source.shape[0]+2,source.shape[1]+2,source.shape[2]))
+
+        temp2 = np.zeros((source.shape[0]+2,source.shape[1]+2,source.shape[2]))
+
+        for i in range(3):
+            temp1[:,:,i] = np.lib.pad(source[:,:,i],(1,1),'symmetric')
+            temp2[:,:,i] = np.lib.pad(target[:,:,i],(1,1),'symmetric')
+        source = temp1
+        target = temp2
+        print("shape t", target.shape)
+        mask = np.lib.pad(mask,(1,1),'constant', constant_values=(0,0))
+
+        t_rows = target.shape[0]
+        t_cols = target.shape[1]
+
+
+        s = np.reshape(source,(t_rows*t_cols,-1),order='F')
+        t = np.reshape(target,(t_rows*t_cols,-1),order='F')
+        print("shape t ", t.shape)
+        b = np.zeros((t_rows*t_cols, 3));
+        print("shape b ",b.shape)
+        print("constructing the matrix A...")
+        print("shape s ", s.shape)
+
+        #row_vec = np.zeros((t_rows*t_cols, 1))
+        #col_vec = np.zeros((t_rows*t_cols,1 ))
+        #value_vec = np.zeros((t_rows*t_cols,1 ))
+        row_vec = []
+        col_vec = []
+        value_vec = []
+
+        equation_num = 0
+
+
+        for i in range(t_rows*t_cols):
+            row = i%t_rows
+            col = i/t_rows
+            if mask[row,col] != 0:
+                b[i,:] = 4*s[i,:] - s[i-1,:] - s[i+1,:] - s[i+t_rows,:] - s[i-t_rows,:]
+                #b[i,:] = temp[ii]
+                row_vec.append(i)
+                col_vec.append(i)
+                value_vec.append(4)
+                equation_num += 1
+                #equation_num = equation_num%(t_rows*t_cols)
+
+                row_vec.append(i)
+                col_vec.append(i+1)
+                value_vec.append(-1)
+                equation_num += 1
+                #equation_num = equation_num%(t_rows*t_cols)
+
+                row_vec.append(i)
+                col_vec.append(i-1)
+                value_vec.append(-1)
+                equation_num += 1
+                #equation_num = equation_num%(t_rows*t_cols)
+
+                row_vec.append(i)
+                col_vec.append(i-t_rows)
+                value_vec.append(-1)
+                equation_num += 1
+                #equation_num = equation_num%(t_rows*t_cols)
+
+                row_vec.append(i)
+                col_vec.append(i+t_rows)
+                value_vec.append(-1)
+                equation_num += 1
+                #equation_num = equation_num%(t_rows*t_cols)
+            else:
+                row_vec.append(i)
+                col_vec.append(i)
+                value_vec.append(1)
+                equation_num += 1
+                #equation_num = equation_num%(t_rows*t_cols)
+
+                b[i,:] = t[i,:]
+        row_vec = np.asarray(row_vec)
+        col_vec = np.asarray(col_vec)
+        value_vec = np.asarray(value_vec)
+        print("row_vec",row_vec.shape)
+        print("col_vec",col_vec.shape)
+        #print(value)
+        #A = (row_vec, col_vec, value_vec, t_rows*t_cols, t_rows*t_cols)
+        A = csr_matrix((value_vec, (row_vec, col_vec)), shape=(t_rows*t_cols, t_rows*t_cols)).toarray()
+
+        f_red = np.linalg.solve(A,b[:,0])
+        f_green = np.linalg.solve(A,b[:,1])
+        f_blue = np.linalg.solve(A,b[:,2])
+
+        f_red = np.reshape(f_red, (t_rows, t_cols), order = 'F')
+        f_green = np.reshape(f_green, (t_rows, t_cols), order ='F')
+        f_blue = np.reshape(f_blue, (t_rows, t_cols), order ='F')
+
+        result = np.zeros((t_rows, t_cols, 3))
+        result[:,:,0] = f_red
+        result[:,:,1] = f_green
+        result[:,:,2] = f_blue
+
+        result = result[1:t_rows-1, 1:t_cols-1, :]
+        return result
+
+
